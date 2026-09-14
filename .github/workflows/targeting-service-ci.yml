@@ -1,0 +1,87 @@
+name: CI - targeting-service
+
+on:
+  workflow_dispatch:
+
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'targeting-service/**'
+      - '.github/workflows/targeting-service-ci.yml'
+
+  push:
+    branches:
+      - main
+    paths:
+      - 'targeting-service/**'
+      - '.github/workflows/targeting-service-ci.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: targeting-service-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+
+  quality-security:
+    name: Build / Lint / Security
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: 'targeting-service/requirements.txt'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install             -r targeting-service/requirements.txt
+          python -m pip install             ruff             bandit             pip-audit
+
+      - name: Python compile
+        run: |
+          python -m compileall             -q             targeting-service
+
+      - name: Lint - Ruff
+        run: |
+          ruff check             --select E9,F63,F7,F82             targeting-service
+
+      - name: SAST - Bandit
+        run: |
+          bandit             -r targeting-service             -lll             -iii
+
+      - name: SCA - pip-audit
+        continue-on-error: true
+        run: |
+          pip-audit             -r targeting-service/requirements.txt
+
+      - name: Trivy filesystem - CRITICAL gate
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: 'targeting-service'
+          format: table
+          severity: CRITICAL
+          exit-code: '1'
+
+      - name: Docker build
+        run: |
+          docker build             --tag togglemaster/targeting-service:${GITHUB_SHA}             targeting-service
+
+      - name: Trivy image - CRITICAL gate
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: 'togglemaster/targeting-service:${{ github.sha }}'
+          format: table
+          severity: CRITICAL
+          exit-code: '1'

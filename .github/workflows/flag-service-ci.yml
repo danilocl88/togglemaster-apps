@@ -1,0 +1,87 @@
+name: CI - flag-service
+
+on:
+  workflow_dispatch:
+
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'flag-service/**'
+      - '.github/workflows/flag-service-ci.yml'
+
+  push:
+    branches:
+      - main
+    paths:
+      - 'flag-service/**'
+      - '.github/workflows/flag-service-ci.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: flag-service-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+
+  quality-security:
+    name: Build / Lint / Security
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: 'flag-service/requirements.txt'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install             -r flag-service/requirements.txt
+          python -m pip install             ruff             bandit             pip-audit
+
+      - name: Python compile
+        run: |
+          python -m compileall             -q             flag-service
+
+      - name: Lint - Ruff
+        run: |
+          ruff check             --select E9,F63,F7,F82             flag-service
+
+      - name: SAST - Bandit
+        run: |
+          bandit             -r flag-service             -lll             -iii
+
+      - name: SCA - pip-audit
+        continue-on-error: true
+        run: |
+          pip-audit             -r flag-service/requirements.txt
+
+      - name: Trivy filesystem - CRITICAL gate
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: 'flag-service'
+          format: table
+          severity: CRITICAL
+          exit-code: '1'
+
+      - name: Docker build
+        run: |
+          docker build             --tag togglemaster/flag-service:${GITHUB_SHA}             flag-service
+
+      - name: Trivy image - CRITICAL gate
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: 'togglemaster/flag-service:${{ github.sha }}'
+          format: table
+          severity: CRITICAL
+          exit-code: '1'
