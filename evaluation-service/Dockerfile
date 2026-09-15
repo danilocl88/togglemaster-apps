@@ -14,6 +14,8 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
 
 FROM alpine:3.22
 
+RUN apk upgrade --no-cache
+
 RUN addgroup -S app && adduser -S -G app app
 
 WORKDIR /app
