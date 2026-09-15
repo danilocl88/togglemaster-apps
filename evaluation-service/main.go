@@ -51,6 +51,26 @@ func main() {
 		log.Fatal("TARGETING_SERVICE_URL deve ser definida")
 	}
 
+	validatedFlagSvcURL, err := validateInternalServiceURL(
+		flagSvcURL,
+		"flag-service",
+		"8002",
+	)
+	if err != nil {
+		log.Fatalf("FLAG_SERVICE_URL invalida: %v", err)
+	}
+	flagSvcURL = validatedFlagSvcURL
+
+	validatedTargetingSvcURL, err := validateInternalServiceURL(
+		targetingSvcURL,
+		"targeting-service",
+		"8003",
+	)
+	if err != nil {
+		log.Fatalf("TARGETING_SERVICE_URL invalida: %v", err)
+	}
+	targetingSvcURL = validatedTargetingSvcURL
+
 	// SQS é opcional no dev local, mas obrigatório em prod
 	sqsQueueURL := os.Getenv("AWS_SQS_URL")
 	awsRegion := os.Getenv("AWS_REGION")
