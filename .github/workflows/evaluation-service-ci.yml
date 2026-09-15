@@ -69,9 +69,11 @@ jobs:
         id: govulncheck
         uses: golang/govulncheck-action@v1.1.0
         with:
+          go-version-input: '1.21.x'
+          cache-dependency-path: evaluation-service/go.sum
+          cache: true
           work-dir: evaluation-service
           repo-checkout: false
-          go-version-file: evaluation-service/go.mod
           go-package: ./...
           output-format: json
           output-file: govulncheck.json
@@ -96,3 +98,108 @@ jobs:
           format: table
           severity: CRITICAL
           exit-code: '1'
+
+      - name: Configure AWS credentials for ECR
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: aws-actions/configure-aws-credentials@v6.2.4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          allowed-account-ids: ${{ vars.AWS_ACCOUNT_ID }}
+
+      - name: Login to Amazon ECR
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2.1.6
+
+      - name: Check immutable ECR tag
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        id: ecr-tag
+        env:
+          ECR_REPOSITORY: evaluation-service
+        run: |
+          set -euo pipefail
+
+          set +e
+          RESULT="$(
+            aws ecr describe-images \
+              --repository-name "$ECR_REPOSITORY" \
+              --image-ids "imageTag=${GITHUB_SHA}" \
+              --region "${{ vars.AWS_REGION }}" \
+              2>&1
+          )"
+          RC=$?
+          set -e
+
+          if [ "$RC" -eq 0 ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "ECR tag ${GITHUB_SHA} already exists; immutable push will be skipped."
+
+          elif echo "$RESULT" | grep -q "ImageNotFoundException"; then
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "ECR tag ${GITHUB_SHA} does not exist yet."
+
+          else
+            echo "Unable to query ECR repository." >&2
+            echo "$RESULT" >&2
+            exit "$RC"
+          fi
+
+      - name: Push image to Amazon ECR
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.ecr-tag.outputs.exists != 'true'
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: evaluation-service
+        run: |
+          set -euo pipefail
+
+          LOCAL_IMAGE="togglemaster/evaluation-service:${GITHUB_SHA}"
+          REMOTE_IMAGE="${ECR_REGISTRY}/${ECR_REPOSITORY}:${GITHUB_SHA}"
+
+          docker image inspect "$LOCAL_IMAGE" >/dev/null
+
+          docker tag \
+            "$LOCAL_IMAGE" \
+            "$REMOTE_IMAGE"
+
+          docker push "$REMOTE_IMAGE"
+
+      - name: Verify Amazon ECR image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: evaluation-service
+        run: |
+          set -euo pipefail
+
+          DIGEST="$(
+            aws ecr describe-images \
+              --repository-name "$ECR_REPOSITORY" \
+              --image-ids "imageTag=${GITHUB_SHA}" \
+              --region "${{ vars.AWS_REGION }}" \
+              --query 'imageDetails[0].imageDigest' \
+              --output text
+          )"
+
+          if [ -z "$DIGEST" ] || [ "$DIGEST" = "None" ]; then
+            echo "ECR image digest nao encontrado." >&2
+            exit 1
+          fi
+
+          IMAGE_URI="${ECR_REGISTRY}/${ECR_REPOSITORY}:${GITHUB_SHA}"
+
+          echo "ECR image verified:"
+          echo "  Repository : ${ECR_REPOSITORY}"
+          echo "  Tag        : ${GITHUB_SHA}"
+          echo "  Digest     : ${DIGEST}"
+
+          {
+            echo "### ECR image"
+            echo
+            echo "- Repository: \`${ECR_REPOSITORY}\`"
+            echo "- Tag: \`${GITHUB_SHA}\`"
+            echo "- Digest: \`${DIGEST}\`"
+            echo "- URI: \`${IMAGE_URI}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
