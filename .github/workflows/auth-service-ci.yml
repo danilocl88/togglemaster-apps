@@ -269,7 +269,7 @@ jobs:
               rf"(?m)^("
               rf"\s*image:\s*"
               rf"{re.escape(expected_repository)}:"
-              rf")[0-9a-f]{40}\s*$"
+              rf")[0-9a-f]{{40}}\s*$"
           )
 
           new_text, count = pattern.subn(
