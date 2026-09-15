@@ -196,3 +196,233 @@ jobs:
             echo "- Digest: \`${DIGEST}\`"
             echo "- URI: \`${IMAGE_URI}\`"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  gitops:
+    name: Update GitOps
+    needs: quality-security
+
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    concurrency:
+      group: togglemaster-gitops-main
+      cancel-in-progress: false
+      queue: max
+
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    env:
+      SERVICE_NAME: auth-service
+      GITOPS_BRANCH: ${{ vars.GITOPS_BRANCH }}
+      AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+      AWS_REGION: ${{ vars.AWS_REGION }}
+
+    steps:
+      - name: Checkout GitOps repository
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ vars.GITOPS_REPOSITORY }}
+          ref: ${{ vars.GITOPS_BRANCH }}
+          ssh-key: ${{ secrets.GITOPS_DEPLOY_KEY }}
+          ssh-strict: true
+          persist-credentials: true
+          fetch-depth: 0
+
+      - name: Update immutable image tag
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          MANIFEST="apps/${SERVICE_NAME}-deployment.yaml"
+
+          if [ ! -f "$MANIFEST" ]; then
+            echo "GitOps manifest not found: $MANIFEST" >&2
+            exit 1
+          fi
+
+          python3 - "$MANIFEST" <<'PYTHON'
+          from pathlib import Path
+          import os
+          import re
+          import sys
+
+          manifest = Path(sys.argv[1])
+
+          service = os.environ["SERVICE_NAME"]
+          account = os.environ["AWS_ACCOUNT_ID"]
+          region = os.environ["AWS_REGION"]
+          sha = os.environ["GITHUB_SHA"]
+
+          registry = (
+              f"{account}.dkr.ecr.{region}.amazonaws.com"
+          )
+
+          expected_repository = (
+              f"{registry}/{service}"
+          )
+
+          text = manifest.read_text()
+
+          pattern = re.compile(
+              rf"(?m)^("
+              rf"\s*image:\s*"
+              rf"{re.escape(expected_repository)}:"
+              rf")[0-9a-f]{40}\s*$"
+          )
+
+          new_text, count = pattern.subn(
+              rf"\g<1>{sha}",
+              text,
+              count=1
+          )
+
+          if count != 1:
+              raise SystemExit(
+                  f"Expected exactly one image reference for "
+                  f"{expected_repository}; replacements={count}"
+              )
+
+          manifest.write_text(new_text)
+
+          print(
+              f"Updated {service} -> {sha}"
+          )
+          PYTHON
+
+      - name: Validate GitOps change
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          MANIFEST="apps/${SERVICE_NAME}-deployment.yaml"
+
+          EXPECTED_IMAGE="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${SERVICE_NAME}:${GITHUB_SHA}"
+
+          if [ ! -f "$MANIFEST" ]; then
+            echo "GitOps manifest not found: $MANIFEST" >&2
+            exit 1
+          fi
+
+          grep -Fq \
+            "image: ${EXPECTED_IMAGE}" \
+            "$MANIFEST"
+
+          MATCH_COUNT="$(
+            grep -Fc \
+              "image: ${EXPECTED_IMAGE}" \
+              "$MANIFEST"
+          )"
+
+          if [ "$MATCH_COUNT" -ne 1 ]; then
+            echo "Expected one exact image reference; found $MATCH_COUNT" >&2
+            exit 1
+          fi
+
+          if grep -Eq \
+            'image:.*:latest([[:space:]]|$)' \
+            "$MANIFEST"
+          then
+            echo "latest tag is not allowed." >&2
+            exit 1
+          fi
+
+          git diff --check
+
+          CHANGED="$(
+            git diff \
+              --name-only
+          )"
+
+          if [ -z "$CHANGED" ]; then
+            echo "Manifest already references ${GITHUB_SHA}."
+            echo "No GitOps diff required."
+
+          elif [ "$CHANGED" = "$MANIFEST" ]; then
+            echo "Exactly one GitOps manifest changed."
+
+          else
+            echo "Unexpected GitOps changes:" >&2
+            echo "$CHANGED" >&2
+            exit 1
+          fi
+
+          echo "GitOps change validated:"
+          echo "  Service : ${SERVICE_NAME}"
+          echo "  SHA     : ${GITHUB_SHA}"
+
+      - name: Commit GitOps image update
+        id: gitops-commit
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          MANIFEST="apps/${SERVICE_NAME}-deployment.yaml"
+
+          git config             user.name             "github-actions[bot]"
+
+          git config             user.email             "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add "$MANIFEST"
+
+          git diff             --cached             --check
+
+          if git diff             --cached             --quiet
+          then
+            echo "No GitOps change required."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git commit             -m "chore(gitops): update ${SERVICE_NAME} to ${GITHUB_SHA}"
+
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Push GitOps update
+        if: steps.gitops-commit.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for ATTEMPT in 1 2 3 4 5; do
+
+            echo "GitOps push attempt ${ATTEMPT}/5"
+
+            if git push               origin               "HEAD:${GITOPS_BRANCH}"
+            then
+              echo "GitOps push completed."
+              exit 0
+            fi
+
+            if [ "$ATTEMPT" -eq 5 ]; then
+              echo "Unable to push GitOps update after 5 attempts." >&2
+              exit 1
+            fi
+
+            echo "Remote changed; rebasing before retry..."
+
+            git fetch               origin               "$GITOPS_BRANCH"
+
+            git rebase               "origin/${GITOPS_BRANCH}"
+
+            sleep "$((ATTEMPT * 2))"
+
+          done
+
+      - name: GitOps summary
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          IMAGE="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${SERVICE_NAME}:${GITHUB_SHA}"
+
+          {
+            echo "### GitOps update"
+            echo
+            echo "- Service: \`${SERVICE_NAME}\`"
+            echo "- Image: \`${IMAGE}\`"
+            echo "- Source SHA: \`${GITHUB_SHA}\`"
+            echo "- Repository: \`${{ vars.GITOPS_REPOSITORY }}\`"
+            echo "- Branch: \`${GITOPS_BRANCH}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
