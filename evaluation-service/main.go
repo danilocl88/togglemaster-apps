@@ -12,6 +12,7 @@ import (
 	"github.com/aws/aws-sdk-go/service/sqs"
 	"github.com/go-redis/redis/v8"
 	"github.com/joho/godotenv"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
 // Contexto global para o Redis
@@ -28,6 +29,12 @@ type App struct {
 }
 
 func main() {
+	shutdownTracing, tracingErr := setupTracing(context.Background())
+	if tracingErr != nil {
+		log.Printf("Falha ao configurar tracing: %v", tracingErr)
+	} else {
+		defer shutdownTracing()
+	}
 	_ = godotenv.Load() // Carrega .env para dev local
 
 	// --- Configuração ---
@@ -123,7 +130,7 @@ func main() {
 	// --- Rotas ---
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", app.healthHandler)
-	mux.HandleFunc("/evaluate", app.evaluationHandler)
+	mux.Handle("/evaluate", otelhttp.NewHandler(http.HandlerFunc(app.evaluationHandler), "GET /evaluate"))
 
 	log.Printf("Serviço de Avaliação (Go) rodando na porta %s", port)
 	if err := http.ListenAndServe(":"+port, mux); err != nil {
