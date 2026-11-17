@@ -114,7 +114,8 @@ func main() {
 
 	// Cliente HTTP (com timeout)
 	httpClient := &http.Client{
-		Timeout: 5 * time.Second,
+		Timeout:   5 * time.Second,
+		Transport: otelhttp.NewTransport(http.DefaultTransport),
 	}
 
 	// Cria a instância da App
